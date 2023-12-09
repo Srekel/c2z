@@ -115,6 +115,10 @@ pub fn main() !void {
             allocator.free(astdump.stderr);
         }
 
+        var astfile = try std.fs.cwd().createFile("lolol.json", .{});
+        try astfile.writeAll(astdump.stdout);
+        astfile.close();
+
         var parsed = try json.parseFromSlice(json.Value, allocator, astdump.stdout, .{});
         defer parsed.deinit();
 

@@ -439,7 +439,7 @@ fn visit(self: *Self, value: *const json.Value) anyerror!void {
     } else if (mem.eql(u8, kind, "FullComment")) {
         // skip
     } else {
-        log.err("unhandled `{s}`", .{kind});
+        log.err("unhandled `{s}` node kind", .{kind});
     }
 }
 
@@ -836,8 +836,30 @@ fn visitCXXConstructorDecl(self: *Self, value: *const json.Value) !void {
 
     // method args
     if (value.object.getPtr("inner")) |inner| {
+        // Comments first
+        var handled_nodes = std.ArrayList(usize).initCapacity(self.allocator, inner.array.len);
+        defer handled_nodes.deinit();
+
+        for (inner.array.items, 0..) |*item, i| {
+            _ = i;
+            self.nodes_visited += 1;
+            handled_nodes.append(true);
+
+            const arg_kind = item.object.get("kind").?.string;
+            if (mem.eql(u8, arg_kind, "CompoundStmt")) {
+                try self.visitCompoundStmt(item);
+            } else if (mem.eql(u8, arg_kind, "FullComment")) {
+                try self.visitFullComment(item);
+            } else {
+                handled_nodes.items[handled_nodes.items.len - 1] = false;
+                self.nodes_visited -= 1;
+                log.err("unhandled `{s}` in ctor `{s}`", .{ arg_kind, parent });
+            }
+        }
+
         for (inner.array.items, 0..) |*item, i| {
             self.nodes_visited += 1;
+            var handled = true;
 
             const arg_kind = item.object.get("kind").?.string;
             if (mem.eql(u8, arg_kind, "ParmVarDecl")) {
@@ -882,8 +904,28 @@ fn visitCXXConstructorDecl(self: *Self, value: *const json.Value) !void {
                 try self.out.print("{s}: {s}", .{ arg, z_type });
             } else if (mem.eql(u8, arg_kind, "FormatAttr")) {
                 // varidatic function with the same properties as printf
+            } else if (mem.eql(u8, arg_kind, "CXXCtorInitializer")) {
+                // constructor initializer for a single variable, not interesting here?
+                // try self.visitCXXCtorInitializer(item);
+            } else if (mem.eql(u8, arg_kind, "CompoundStmt")) {
+                try self.visitCompoundStmt(item);
+            } else if (mem.eql(u8, arg_kind, "FullComment")) {
+                try self.visitFullComment(item);
             } else {
+                handled = false;
                 self.nodes_visited -= 1;
+                log.err("unhandled `{s}` in ctor `{s}`", .{ arg_kind, parent });
+            }
+
+            if (handled) {
+                handled_nodes[i] = true;
+            }
+        }
+
+        for (handled_nodes.items, 0..) |handled, i| {
+            if (!handled) {
+                const item = inner.array[i];
+                const arg_kind = item.object.get("kind").?.string;
                 log.err("unhandled `{s}` in ctor `{s}`", .{ arg_kind, parent });
             }
         }
@@ -918,9 +960,49 @@ fn visitCXXConstructorDecl(self: *Self, value: *const json.Value) !void {
     self.scope.ctors += 1;
 }
 
-// fn visitCXXCtorInitializer(self: *Self, value: *const json.Value) !void {
-//
-// }
+fn visitCXXCtorInitializer(self: *Self, value: *const json.Value) !void {
+    const any_init = value.object.get("anyInit").?;
+    const member_name = any_init.object.get("name").?.string;
+    const inner = value.object.get("inner");
+    if (inner == null or inner.?.array.items.len == 0) {
+        log.err("`CXXCtorInitializer` for `{s}` with empty inner body", .{member_name});
+        return;
+    }
+    const inner_item = inner.?.array.items[0];
+    const inner_kind = inner_item.object.get("kind");
+    if (inner_kind == null) {
+        log.err("`CXXCtorInitializer` for `{s}` with empty inner", .{member_name});
+        return;
+    }
+    if (!mem.eql(u8, inner_kind.?.string, "ImplicitCastExpr")) {
+        log.err("`CXXCtorInitializer` for `{s}` with wrong inner type `{s}`", .{ member_name, inner_kind.?.string });
+        return;
+    }
+
+    try self.out.print(" lolol .{s} = ", .{member_name});
+    try self.visitImplicitCastExpr(&inner_item);
+
+    // const inner2 = inner_item.object.get("inner");
+    // const inner2_item = inner2.array.items[0];
+    // _ = inner2_item;
+    // if (inner2 == null or inner2.array.items.length == 0) {
+    //     log.err("`CXXCtorInitializer` for `{s}` with empty inner body inside inner `{s}`", .{ member_name, inner_kind.?.string });
+    //     return;
+    // }
+    // const inner_kind2 = inner2.?.object.get("kind");
+    // if (inner_kind2 == null) {
+    //     log.err("`CXXCtorInitializer` for `{s}` with empty inner inside inner `{s}`", .{ member_name, inner_kind.?.string });
+    //     return;
+    // }
+    // if (!mem.eql(u8, inner_kind2.?.string, "ImplicitCastExpr")) {
+    //     log.err("`CXXCtorInitializer` for `{s}` with wrong inner type `{s}` inside inner `{s}`", .{ member_name, inner_kind2.?.string, inner_kind.?.string });
+    //     return;
+    // }
+
+    // const referenced_decl = inner2.?.object.get("referencedDecl").?;
+    // const param_name = referenced_decl.object.get("name").?;
+    // try self.out.print(" .{s} = {s}\n", .{ member_name, param_name.string });
+}
 
 fn visitCXXTemporaryObjectExpr(self: *Self, value: *const json.Value) !void {
     const ty = typeQualifier(value).?;
@@ -1374,12 +1456,18 @@ fn visitFunctionTemplateDecl(self: *Self, node: *const json.Value) !void {
             }
 
             const f_items = f_inner.?.array.items;
-
-            if (f_items.len > 0) {
-                if (!mem.eql(u8, f_items[f_items.len - 1].object.getPtr("kind").?.string, "CompoundStmt")) {
-                    log.err("`FunctionTemplateDecl` `{s}` without `CompoundStmt`", .{name});
-                    return;
+            const found_compound_stmt = blk: {
+                for (f_items) |f_item| {
+                    const f_item_kind = f_item.object.getPtr("kind").?.string;
+                    if (mem.eql(u8, f_item_kind, "CompoundStmt")) {
+                        break :blk true;
+                    }
                 }
+                break :blk false;
+            };
+            if (!found_compound_stmt) {
+                log.err("`FunctionTemplateDecl` `{s}` without `CompoundStmt`", .{name});
+                return;
             }
 
             const sig = parseFnSignature(item).?;
@@ -2492,6 +2580,12 @@ fn visitFullComment(self: *Self, node: *const json.Value) !void {
         const kind = item.object.getPtr("kind").?.string;
         if (mem.eql(u8, kind, "ParagraphComment")) {
             try self.visitParagraphComment(item);
+        } else if (mem.eql(u8, kind, "VerbatimLineComment")) {
+            // try self.visitVerbatimLineComment(item);
+        } else if (mem.eql(u8, kind, "ParamCommandComment")) {
+            // try self.visitParamCommandComment(item);
+        } else if (mem.eql(u8, kind, "BlockCommandComment")) {
+            // try self.visitBlockCommandComment(item);
         } else {
             log.err("unhandled `{s}` in `FullComment`", .{kind});
         }
@@ -2509,6 +2603,13 @@ fn visitParagraphComment(self: *Self, node: *const json.Value) !void {
             _ = try self.out.write("///");
             _ = try self.out.write(text);
             _ = try self.out.write("\n");
+        } else if (mem.eql(u8, kind, "InlineCommandComment")) {
+            self.nodes_visited += 1;
+            const name = item.object.getPtr("name").?.string;
+            _ = try self.out.write("@");
+            _ = try self.out.write(name);
+            _ = try self.out.write(" ");
+            // for ()
         } else {
             log.err("unhandled `{s}` in `ParagraphComment`", .{kind});
         }
